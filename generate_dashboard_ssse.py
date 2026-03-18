@@ -45,7 +45,7 @@ SP_SITE_PATH = "/sites/SDAHSESTPA"
 
 # Chemin du fichier Excel dans SharePoint
 EXCEL_PATH   = os.getenv("EXCEL_PATH",
-               "Documents Partages/2025 CQ SBOULA FOCQT01_02.xlsx")
+               "Documents/Collaboratif -SBOULA-/Contrôle Qualité -CQT-/Controle qualité -SBOULA-/2025 CQ SBOULA/2025 CQ SBOULA FOCQT01_02.xlsx")
 SHEET_NAME   = "Semoule SSSE"
 OUTPUT_HTML  = "dashboard_ssse.html"
 
