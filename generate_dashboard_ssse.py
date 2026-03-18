@@ -1,20 +1,25 @@
 """
 Dashboard Qualité — Semoule SSSE
 =================================
-VERSION CORRIGÉE — Compatible SSO / ADFS entreprise
-
-3 modes d'authentification disponibles (choisis selon ton organisation) :
-  MODE 1 : Lien de partage SharePoint public  ← le plus simple, aucune auth
-  MODE 2 : Client ID + Secret Azure AD        ← si ton admin peut créer une App
-  MODE 3 : Login / mot de passe direct        ← si M365 standard (pas SSO fédéré)
-
-Change la variable AUTH_MODE ci-dessous selon ce qui fonctionne.
+CONNEXION : Device Login Microsoft (ton propre compte)
+→ Aucun admin requis
+→ Aucun secret à configurer
+→ Fonctionne avec tout compte Microsoft 365
 
 Prérequis :
-    pip install office365-rest-python-client pandas openpyxl plotly jinja2 requests python-dotenv
+    pip install msal pandas openpyxl plotly requests python-dotenv
+
+Utilisation :
+    python generate_dashboard_ssse_devicelogin.py
+
+    → Le script affiche un code dans le terminal
+    → Tu vas sur https://microsoft.com/devicelogin
+    → Tu entres le code
+    → Tu te connectes avec ton compte entreprise
+    → Le script continue automatiquement
 """
 
-import io, os, json, requests
+import io, os, json, sys, webbrowser
 from datetime import datetime
 
 try:
@@ -23,45 +28,35 @@ try:
 except ImportError:
     pass
 
+import requests
 import pandas as pd
-import plotly.express as px
 import plotly.graph_objects as go
 import plotly.io as pio
 from jinja2 import Template
+import msal
 
 # ============================================================
-#  CONFIG — modifie ces valeurs
+#  CONFIG — seules ces valeurs sont à adapter
 # ============================================================
 
-# Choix du mode d'authentification : "sharelink" | "appcredential" | "userpassword"
-AUTH_MODE = os.getenv("AUTH_MODE", "sharelink")
+# URL de ton site SharePoint
+SP_SITE      = "roseblanchetn.sharepoint.com"
+SP_SITE_PATH = "/sites/SDAHSESTPA"
 
-# --- MODE 1 : Lien de partage (le plus simple) ---
-# Ouvre le fichier Excel sur SharePoint → Partager → Copier le lien
-# Ajoute &download=1 à la fin
-SHARE_LINK = os.getenv("SHARE_LINK",
-    "https://roseblanchetn.sharepoint.com/:x:/r/sites/SDAHSESTPA/_layouts/15/Doc.aspx"
-    "?sourcedoc=%7B0761FA65-3D84-4B10-B009-8CA5BF050C98%7D"
-    "&file=2025%20CQ%20SBOULA%20FOCQT01_02.xlsx&action=default&download=1"
-)
+# Chemin du fichier Excel dans SharePoint
+EXCEL_PATH   = os.getenv("EXCEL_PATH",
+               "Documents Partages/2025 CQ SBOULA FOCQT01_02.xlsx")
+SHEET_NAME   = "Semoule SSSE"
+OUTPUT_HTML  = "dashboard_ssse.html"
 
-# --- MODE 2 : App Registration Azure AD (demande à ton admin IT) ---
-TENANT_ID     = os.getenv("TENANT_ID",     "")
-CLIENT_ID     = os.getenv("CLIENT_ID",     "")
-CLIENT_SECRET = os.getenv("CLIENT_SECRET", "")
-SP_SITE_URL   = os.getenv("SP_URL",        "https://roseblanchetn.sharepoint.com/sites/SDAHSESTPA")
+# Client ID public Microsoft (Graph Explorer — utilisable par tous, pas besoin d'admin)
+# C'est l'ID officiel de l'application "Microsoft Azure CLI" — public et gratuit
+CLIENT_ID    = "04b07795-8ddb-461a-bbee-02f9e1bf7b46"
+AUTHORITY    = "https://login.microsoftonline.com/organizations"
+SCOPES       = ["https://graph.microsoft.com/Sites.Read.All",
+                "https://graph.microsoft.com/Files.ReadWrite.All"]
 
-# --- MODE 3 : Login / mot de passe (M365 standard uniquement) ---
-SP_USER     = os.getenv("SP_USER",     "")
-SP_PASSWORD = os.getenv("SP_PASSWORD", "")
-SP_URL      = os.getenv("SP_URL",      "https://roseblanchetn.sharepoint.com/sites/SDAHSESTPA")
-
-# Chemin du fichier Excel dans SharePoint (pour l'upload du HTML)
-EXCEL_PATH  = os.getenv("EXCEL_PATH",  "Documents Partages/2025 CQ SBOULA FOCQT01_02.xlsx")
-SHEET_NAME  = "Semoule SSSE"
-OUTPUT_HTML = "dashboard_ssse.html"
-
-# Colonnes du fichier
+# Colonnes SSSE
 COL_DATE     = "Date"
 COL_LOT      = "N°lot"
 COL_ETAPE    = "Etape"
@@ -76,129 +71,114 @@ MOIS_FR = {
 }
 
 # ============================================================
-#  ETAPE 1 — Lecture du fichier Excel
+#  ETAPE 1 — Authentification Device Login
 # ============================================================
 
-def read_excel() -> pd.DataFrame:
-    """Lit le fichier Excel selon le mode d'auth choisi."""
-
-    if AUTH_MODE == "sharelink":
-        return _read_via_sharelink()
-    elif AUTH_MODE == "appcredential":
-        return _read_via_app_credential()
-    elif AUTH_MODE == "userpassword":
-        return _read_via_userpassword()
-    else:
-        raise ValueError(f"AUTH_MODE inconnu : {AUTH_MODE}")
-
-
-def _read_via_sharelink() -> pd.DataFrame:
+def get_token() -> str:
     """
-    MODE 1 — Lien de partage SharePoint.
-    Le fichier doit avoir un lien de partage actif (interne organisation).
+    Ouvre un flux Device Login :
+    1. Affiche un code dans le terminal
+    2. Tu vas sur https://microsoft.com/devicelogin
+    3. Tu entres le code et tu te connectes
+    4. Le script récupère le token automatiquement
+    Token mis en cache → pas besoin de se reconnecter à chaque exécution
     """
-    print(f"  Mode : lien de partage SharePoint")
-    # Ajouter le cookie de session si nécessaire
-    headers = {
-        "User-Agent": "Mozilla/5.0",
-        "Accept": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-    }
+    cache = msal.SerializableTokenCache()
+    cache_file = ".token_cache.json"
 
-    # Essai 1 : téléchargement direct via l'ID unique du fichier
-    direct_url = (
-        "https://roseblanchetn.sharepoint.com/sites/SDAHSESTPA"
-        "/_layouts/15/download.aspx"
-        "?UniqueId=0761FA65-3D84-4B10-B009-8CA5BF050C98"
+    # Charger le cache existant si disponible
+    if os.path.exists(cache_file):
+        with open(cache_file, "r") as f:
+            cache.deserialize(f.read())
+
+    app = msal.PublicClientApplication(
+        client_id=CLIENT_ID,
+        authority=AUTHORITY,
+        token_cache=cache
     )
 
-    resp = requests.get(direct_url, headers=headers, timeout=30)
+    # Essayer d'utiliser un token en cache d'abord
+    accounts = app.get_accounts()
+    if accounts:
+        print(f"  Compte en cache : {accounts[0]['username']}")
+        result = app.acquire_token_silent(SCOPES, account=accounts[0])
+        if result and "access_token" in result:
+            print("  Token valide trouvé dans le cache")
+            _save_cache(cache, cache_file)
+            return result["access_token"]
 
-    # Si redirigé vers login → essayer avec le lien complet
-    if resp.status_code != 200 or b"<!DOCTYPE" in resp.content[:100]:
-        print("  → Redirection login détectée, essai avec SHARE_LINK...")
-        resp = requests.get(SHARE_LINK, headers=headers, timeout=30, allow_redirects=True)
+    # Sinon, lancer le Device Login
+    flow = app.initiate_device_flow(scopes=SCOPES)
 
-    if resp.status_code != 200 or b"<!DOCTYPE" in resp.content[:100]:
-        raise ConnectionError(
-            "Impossible de télécharger le fichier via lien public.\n"
-            "→ Essaie AUTH_MODE='appcredential' ou demande à ton admin IT\n"
-            "  de créer une App Registration Azure AD."
-        )
+    if "user_code" not in flow:
+        raise Exception(f"Erreur Device Login : {flow}")
 
-    df = pd.read_excel(io.BytesIO(resp.content), sheet_name=SHEET_NAME, header=0)
-    print(f"  {len(df)} lignes lues")
-    return df
+    print("\n" + "="*55)
+    print("  CONNEXION REQUISE")
+    print("="*55)
+    print(f"\n  1. Ouvre cette URL dans ton navigateur :")
+    print(f"     https://microsoft.com/devicelogin")
+    print(f"\n  2. Entre ce code : {flow['user_code']}")
+    print(f"\n  3. Connecte-toi avec ton compte Microsoft entreprise")
+    print(f"\n  En attente de ta connexion...")
+    print("="*55 + "\n")
+
+    # Ouvrir automatiquement le navigateur
+    try:
+        webbrowser.open("https://microsoft.com/devicelogin")
+    except Exception:
+        pass
+
+    # Attendre la connexion (timeout 5 min)
+    result = app.acquire_token_by_device_flow(flow)
+
+    if "access_token" not in result:
+        raise Exception(f"Connexion échouée : {result.get('error_description', result)}")
+
+    print(f"  Connecté avec succès !")
+    _save_cache(cache, cache_file)
+    return result["access_token"]
 
 
-def _read_via_app_credential() -> pd.DataFrame:
-    """
-    MODE 2 — Application Azure AD (Client Credentials).
-    Nécessite : TENANT_ID, CLIENT_ID, CLIENT_SECRET
-    Demande à ton admin IT de créer une App Registration avec
-    permission Sites.Read.All sur Microsoft Graph.
-    """
-    print("  Mode : Azure AD App Credential")
+def _save_cache(cache, path):
+    if cache.has_state_changed:
+        with open(path, "w") as f:
+            f.write(cache.serialize())
 
-    # 1. Obtenir le token
-    token_url = f"https://login.microsoftonline.com/{TENANT_ID}/oauth2/v2.0/token"
-    resp = requests.post(token_url, data={
-        "grant_type"   : "client_credentials",
-        "client_id"    : CLIENT_ID,
-        "client_secret": CLIENT_SECRET,
-        "scope"        : "https://graph.microsoft.com/.default"
-    })
-    resp.raise_for_status()
-    token = resp.json()["access_token"]
 
-    # 2. Récupérer l'ID du site
-    site_resp = requests.get(
-        "https://graph.microsoft.com/v1.0/sites/roseblanchetn.sharepoint.com:/sites/SDAHSESTPA",
-        headers={"Authorization": f"Bearer {token}"}
+# ============================================================
+#  ETAPE 2 — Lecture Excel depuis SharePoint via Graph API
+# ============================================================
+
+def read_excel(token: str) -> pd.DataFrame:
+    headers = {"Authorization": f"Bearer {token}"}
+
+    # Récupérer l'ID du site
+    site_url = (
+        f"https://graph.microsoft.com/v1.0/sites/"
+        f"{SP_SITE}:{SP_SITE_PATH}"
     )
+    site_resp = requests.get(site_url, headers=headers)
     site_resp.raise_for_status()
     site_id = site_resp.json()["id"]
+    print(f"  Site ID trouvé : {site_id.split(',')[1]}")
 
-    # 3. Télécharger le fichier
+    # Télécharger le fichier Excel
     file_url = (
         f"https://graph.microsoft.com/v1.0/sites/{site_id}"
         f"/drive/root:/{EXCEL_PATH}:/content"
     )
-    file_resp = requests.get(file_url, headers={"Authorization": f"Bearer {token}"})
+    file_resp = requests.get(file_url, headers=headers)
     file_resp.raise_for_status()
 
-    df = pd.read_excel(io.BytesIO(file_resp.content), sheet_name=SHEET_NAME, header=0)
-    print(f"  {len(df)} lignes lues")
-    return df
-
-
-def _read_via_userpassword() -> pd.DataFrame:
-    """
-    MODE 3 — Login / mot de passe.
-    Fonctionne uniquement avec M365 standard (pas SSO/ADFS fédéré).
-    """
-    from office365.runtime.auth.user_credential import UserCredential
-    from office365.sharepoint.client_context import ClientContext
-
-    print("  Mode : Login / mot de passe")
-    creds = UserCredential(SP_USER, SP_PASSWORD)
-    ctx   = ClientContext(SP_URL).with_credentials(creds)
-    web   = ctx.web
-    ctx.load(web)
-    ctx.execute_query()
-    print(f"  Connecté : {web.title}")
-
-    buf         = io.BytesIO()
-    server_path = f"{ctx.web.server_relative_url}/{EXCEL_PATH}"
-    ctx.web.get_file_by_server_relative_url(server_path)\
-        .download(buf).execute_query()
-    buf.seek(0)
-    df = pd.read_excel(buf, sheet_name=SHEET_NAME, header=0)
-    print(f"  {len(df)} lignes lues")
+    df = pd.read_excel(io.BytesIO(file_resp.content),
+                       sheet_name=SHEET_NAME, header=0)
+    print(f"  {len(df)} lignes lues — feuille '{SHEET_NAME}'")
     return df
 
 
 # ============================================================
-#  ETAPE 2 — Nettoyage des données SSSE
+#  ETAPE 3 — Préparation des données SSSE
 # ============================================================
 
 def prepare_data(df: pd.DataFrame):
@@ -211,13 +191,13 @@ def prepare_data(df: pd.DataFrame):
     df_anom = df[df[COL_PROBLEME].notna()].copy()
     df_anom[COL_PROBLEME] = df_anom[COL_PROBLEME].astype(str).str.strip()
 
-    print(f"  Analyses  : {len(df)}")
-    print(f"  Anomalies : {len(df_anom)}")
+    print(f"  Total analyses  : {len(df)}")
+    print(f"  Total anomalies : {len(df_anom)}")
     return df, df_anom
 
 
 # ============================================================
-#  ETAPE 3 — Sérialisation JSON pour le dashboard
+#  ETAPE 4 — Sérialisation JSON
 # ============================================================
 
 def serialize(df_all, df_anom) -> dict:
@@ -244,7 +224,7 @@ def serialize(df_all, df_anom) -> dict:
 
 
 # ============================================================
-#  ETAPE 4 — Template HTML du dashboard
+#  ETAPE 5 — Dashboard HTML
 # ============================================================
 
 DASHBOARD_HTML = """<!DOCTYPE html>
@@ -348,7 +328,7 @@ const PROB_PILL={'PIQUAGE BRUN':'p-red','PIQUAGE NOIR':'p-purple','GRANULOMETRIE
 const LAY={paper_bgcolor:'rgba(0,0,0,0)',plot_bgcolor:'rgba(0,0,0,0)',font:{color:'#c8dff0',size:11},margin:{l:10,r:10,t:10,b:10}};
 const CFG={displayModeBar:false,responsive:true};
 function unique(k){return[...new Set(ALL_DATA.map(r=>r[k]))].filter(Boolean);}
-function fillSel(id,vals,lbFn){const s=document.getElementById(id);const p=s.value;while(s.options.length>1)s.remove(1);vals.forEach(v=>{const o=new Option(lbFn?lbFn(v):v,v);s.appendChild(o);});if(p)s.value=p;}
+function fillSel(id,vals,lbFn){const s=document.getElementById(id);const p=s.value;while(s.options.length>1)s.remove(1);vals.forEach(v=>{s.appendChild(new Option(lbFn?lbFn(v):v,v));});if(p)s.value=p;}
 function populateFilters(){
   fillSel('f-annee',unique('annee').sort());
   fillSel('f-mois',unique('mois_num').sort((a,b)=>+a-+b),v=>MOIS_FR[+v]||v);
@@ -357,48 +337,42 @@ function populateFilters(){
   fillSel('f-etape',unique('etape').sort());
 }
 function getFiltered(){
-  const a=document.getElementById('f-annee').value;
-  const m=document.getElementById('f-mois').value;
-  const d=document.getElementById('f-date').value;
-  const p=document.getElementById('f-prob').value;
+  const a=document.getElementById('f-annee').value,m=document.getElementById('f-mois').value;
+  const d=document.getElementById('f-date').value,p=document.getElementById('f-prob').value;
   const e=document.getElementById('f-etape').value;
   return ALL_DATA.filter(r=>(!a||r.annee===a)&&(!m||r.mois_num===+m)&&(!d||r.date===d)&&(!p||r.probleme===p)&&(!e||r.etape===e));
 }
 function render(){
   const fd=getFiltered();const n=fd.length;
   const isF=n<ALL_DATA.length;
-  document.getElementById('filter-info').textContent=isF?`Filtre actif : ${n} / ${ALL_DATA.length} anomalies`:'';
+  document.getElementById('filter-info').textContent=isF?`Filtre : ${n} / ${ALL_DATA.length} anomalies`:'';
   document.getElementById('k-total').textContent=TOTAL_ANALYSES.toLocaleString('fr');
   document.getElementById('k-anom').textContent=n.toLocaleString('fr');
-  document.getElementById('k-anom-sub').textContent=isF?`(total : ${ALL_DATA.length})`:'période complète';
+  document.getElementById('k-anom-sub').textContent=isF?`(total:${ALL_DATA.length})`:'période complète';
   document.getElementById('k-taux').textContent=TOTAL_ANALYSES>0?(n/TOTAL_ANALYSES*100).toFixed(1)+'%':'—';
-  const notifOui=fd.filter(r=>r.notif==='Oui').length;
-  document.getElementById('k-notif').textContent=notifOui.toLocaleString('fr');
-  document.getElementById('k-notif-sub').textContent=n>0?`${(notifOui/n*100).toFixed(0)}% des anomalies`:'—';
+  const nOui=fd.filter(r=>r.notif==='Oui').length;
+  document.getElementById('k-notif').textContent=nOui.toLocaleString('fr');
+  document.getElementById('k-notif-sub').textContent=n>0?`${(nOui/n*100).toFixed(0)}% des anomalies`:'—';
   const cntP={};fd.forEach(r=>cntP[r.probleme]=(cntP[r.probleme]||0)+1);
   const topP=Object.entries(cntP).sort((a,b)=>b[1]-a[1]);
   document.getElementById('k-top').textContent=topP.length?`${topP[0][0]} (${topP[0][1]})`:'—';
   document.getElementById('meta-info').textContent=`Généré le ${GENERATED_AT} · SharePoint · Semoule SSSE`;
-  // Barres
   if(!topP.length){Plotly.newPlot('ch-type',[],{...LAY,height:260},CFG);}
   else{const s=topP.slice(0,9).reverse();Plotly.newPlot('ch-type',[{type:'bar',orientation:'h',y:s.map(x=>x[0]),x:s.map(x=>x[1]),marker:{color:s.map(x=>PROB_COLORS[x[0]]||'#2e8adf')},text:s.map(x=>x[1]),textposition:'outside',hovertemplate:'%{y}: %{x}<extra></extra>'}],{...LAY,height:260,margin:{l:190,r:50,t:10,b:20},xaxis:{gridcolor:'#1a3a52'},yaxis:{gridcolor:'rgba(0,0,0,0)'}},CFG);}
-  // Camembert
   const cntE={};fd.forEach(r=>cntE[r.etape]=(cntE[r.etape]||0)+1);
   const topE=Object.entries(cntE).sort((a,b)=>b[1]-a[1]);
   if(!topE.length){Plotly.newPlot('ch-etape',[],{...LAY,height:260},CFG);}
-  else{Plotly.newPlot('ch-etape',[{type:'pie',labels:topE.map(x=>x[0]),values:topE.map(x=>x[1]),hole:0.42,marker:{colors:['#2e8adf','#27ae8f','#e67e22','#8e44ad','#c0392b','#f39c12','#1abc9c']},textinfo:'label+percent',textfont:{size:10,color:'#c8dff0'},hovertemplate:'%{label}: %{value}<extra></extra>'}],{...LAY,height:260,showlegend:true,legend:{font:{size:10,color:'#7a9ab8'},bgcolor:'rgba(0,0,0,0)'}},CFG);}
-  // Tendance
+  else{Plotly.newPlot('ch-etape',[{type:'pie',labels:topE.map(x=>x[0]),values:topE.map(x=>x[1]),hole:0.42,marker:{colors:['#2e8adf','#27ae8f','#e67e22','#8e44ad','#c0392b','#f39c12']},textinfo:'label+percent',textfont:{size:10},hovertemplate:'%{label}: %{value}<extra></extra>'}],{...LAY,height:260,showlegend:true,legend:{font:{size:10,color:'#7a9ab8'},bgcolor:'rgba(0,0,0,0)'}},CFG);}
   const cntM={};fd.forEach(r=>{const k=r.annee+'-'+String(r.mois_num).padStart(2,'0');cntM[k]=(cntM[k]||0)+1;});
   const mKeys=Object.keys(cntM).sort();
-  const mLabels=mKeys.map(k=>{const[y,m]=k.split('-');return MOIS_FR[+m].slice(0,3)+' '+y;});
+  const mLbls=mKeys.map(k=>{const[y,m]=k.split('-');return MOIS_FR[+m].slice(0,3)+' '+y;});
   if(!mKeys.length){Plotly.newPlot('ch-trend',[],{...LAY,height:220},CFG);}
-  else{Plotly.newPlot('ch-trend',[{type:'scatter',mode:'lines+markers',x:mLabels,y:mKeys.map(k=>cntM[k]),line:{color:'#2e8adf',width:2,shape:'spline'},marker:{color:'#2e8adf',size:7},fill:'tozeroy',fillcolor:'rgba(46,138,223,0.1)',hovertemplate:'%{x}: <b>%{y}</b> anomalie(s)<extra></extra>'}],{...LAY,height:220,margin:{l:40,r:20,t:10,b:70},xaxis:{gridcolor:'#1a3a52',tickangle:-45,tickfont:{size:10}},yaxis:{gridcolor:'#1a3a52',tickfont:{size:10}}},CFG);}
-  // Tableau
+  else{Plotly.newPlot('ch-trend',[{type:'scatter',mode:'lines+markers',x:mLbls,y:mKeys.map(k=>cntM[k]),line:{color:'#2e8adf',width:2,shape:'spline'},marker:{color:'#2e8adf',size:7},fill:'tozeroy',fillcolor:'rgba(46,138,223,0.1)',hovertemplate:'%{x}: <b>%{y}</b><extra></extra>'}],{...LAY,height:220,margin:{l:40,r:20,t:10,b:70},xaxis:{gridcolor:'#1a3a52',tickangle:-45,tickfont:{size:10}},yaxis:{gridcolor:'#1a3a52',tickfont:{size:10}}},CFG);}
   const tbody=document.getElementById('tbl-body');
-  const display=fd.slice(0,100);
+  const disp=fd.slice(0,100);
   document.getElementById('tbl-count').textContent=fd.length>100?`(100 sur ${fd.length})`:fd.length>0?`(${fd.length})`:'';;
-  if(!display.length){tbody.innerHTML='<tr><td colspan="7" class="no-data">Aucune anomalie</td></tr>';return;}
-  tbody.innerHTML=display.map(r=>`<tr>
+  if(!disp.length){tbody.innerHTML='<tr><td colspan="7" class="no-data">Aucune anomalie</td></tr>';return;}
+  tbody.innerHTML=disp.map(r=>`<tr>
     <td style="color:#7a9ab8">${r.date}</td><td>${r.lot}</td>
     <td style="font-size:11px;color:#5a8ab8">${r.echant}</td>
     <td><span class="pill p-blue">${r.etape}</span></td>
@@ -416,65 +390,40 @@ populateFilters();render();
 
 
 def generate_html(payload: dict) -> str:
-    data_json = json.dumps(payload, ensure_ascii=False)
-    return DASHBOARD_HTML.replace("__DATA_JSON__", data_json)
+    return DASHBOARD_HTML.replace("__DATA_JSON__", json.dumps(payload, ensure_ascii=False))
 
 
 # ============================================================
-#  ETAPE 5 — Upload HTML sur SharePoint
+#  ETAPE 6 — Upload HTML sur SharePoint
 # ============================================================
 
-def upload_html(html: str) -> str:
-    """
-    Upload dashboard.html sur SharePoint.
-    Utilise le même mode d'auth que pour la lecture.
-    """
-    if AUTH_MODE == "appcredential":
-        return _upload_via_graph(html)
-    elif AUTH_MODE == "userpassword":
-        return _upload_via_office365(html)
-    else:
-        # Mode sharelink : sauvegarde locale, upload manuel
-        local_path = OUTPUT_HTML
-        with open(local_path, "w", encoding="utf-8") as f:
-            f.write(html)
-        print(f"  Sauvegardé localement : {local_path}")
-        print("  ⚠ Upload automatique non disponible en mode 'sharelink'.")
-        print("  → Dépose manuellement le fichier sur SharePoint.")
-        return local_path
+def upload_html(token: str, html: str) -> str:
+    headers = {"Authorization": f"Bearer {token}"}
 
-
-def _upload_via_graph(html: str) -> str:
-    token_url = f"https://login.microsoftonline.com/{TENANT_ID}/oauth2/v2.0/token"
-    resp = requests.post(token_url, data={
-        "grant_type":"client_credentials","client_id":CLIENT_ID,
-        "client_secret":CLIENT_SECRET,"scope":"https://graph.microsoft.com/.default"
-    })
-    resp.raise_for_status()
-    token = resp.json()["access_token"]
+    # Récupérer l'ID du site
     site_resp = requests.get(
-        "https://graph.microsoft.com/v1.0/sites/roseblanchetn.sharepoint.com:/sites/SDAHSESTPA",
-        headers={"Authorization":f"Bearer {token}"}
+        f"https://graph.microsoft.com/v1.0/sites/{SP_SITE}:{SP_SITE_PATH}",
+        headers=headers
     )
+    site_resp.raise_for_status()
     site_id = site_resp.json()["id"]
+
+    # Dossier cible = même dossier que l'Excel
     folder = "/".join(EXCEL_PATH.split("/")[:-1])
-    upload_url = f"https://graph.microsoft.com/v1.0/sites/{site_id}/drive/root:/{folder}/{OUTPUT_HTML}:/content"
-    up = requests.put(upload_url, headers={"Authorization":f"Bearer {token}","Content-Type":"text/html"}, data=html.encode("utf-8"))
+    upload_url = (
+        f"https://graph.microsoft.com/v1.0/sites/{site_id}"
+        f"/drive/root:/{folder}/{OUTPUT_HTML}:/content"
+    )
+    up = requests.put(
+        upload_url,
+        headers={**headers, "Content-Type": "text/html"},
+        data=html.encode("utf-8")
+    )
     up.raise_for_status()
-    url = SP_SITE_URL.split("/sites/")[0] + up.json().get("webUrl","")
-    return url
 
-
-def _upload_via_office365(html: str) -> str:
-    from office365.runtime.auth.user_credential import UserCredential
-    from office365.sharepoint.client_context import ClientContext
-    creds  = UserCredential(SP_USER, SP_PASSWORD)
-    ctx    = ClientContext(SP_URL).with_credentials(creds)
-    folder = "/".join(EXCEL_PATH.split("/")[:-1])
-    srv    = f"{ctx.web.server_relative_url}/{folder}"
-    up     = ctx.web.get_folder_by_server_relative_url(srv)\
-                 .upload_file(OUTPUT_HTML, html.encode("utf-8")).execute_query()
-    return SP_URL.split("/sites/")[0] + up.serverRelativeUrl
+    web_url = up.json().get("webUrl", "")
+    print(f"  Uploadé : {web_url}")
+    return web_url
 
 
 # ============================================================
@@ -482,31 +431,33 @@ def _upload_via_office365(html: str) -> str:
 # ============================================================
 
 if __name__ == "__main__":
-    print("\n" + "="*50)
-    print("  Dashboard Qualité SSSE")
-    print(f"  Mode auth : {AUTH_MODE}")
-    print("="*50 + "\n")
+    print("\n" + "="*55)
+    print("  Dashboard Qualité SSSE — Device Login")
+    print("="*55 + "\n")
 
-    print("[1/4] Lecture du fichier Excel SharePoint...")
-    df_raw = read_excel()
+    print("[1/5] Authentification Microsoft (Device Login)...")
+    token = get_token()
 
-    print("\n[2/4] Préparation des données...")
+    print("\n[2/5] Lecture fichier Excel SharePoint...")
+    df_raw = read_excel(token)
+
+    print("\n[3/5] Préparation des données SSSE...")
     df_all, df_anom = prepare_data(df_raw)
 
-    print("\n[3/4] Génération du dashboard HTML...")
+    print("\n[4/5] Génération du dashboard HTML...")
     payload = serialize(df_all, df_anom)
     html    = generate_html(payload)
-    print(f"  Taille HTML : {len(html)//1024} Ko")
+    print(f"  Taille : {len(html)//1024} Ko")
 
-    print("\n[4/4] Upload sur SharePoint...")
-    url = upload_html(html)
+    print("\n[5/5] Upload sur SharePoint...")
+    url = upload_html(token, html)
 
-    print("\n" + "="*50)
-    print("  TERMINÉ")
-    print("="*50)
-    print(f"  Anomalies  : {payload['total_anomalies']}")
-    print(f"  Analyses   : {payload['total_analyses']}")
-    print(f"  Généré le  : {payload['generated_at']}")
-    print(f"\n  Fichier    : {url}")
-    print(f"\n  Power Apps → Web viewer → URL :")
+    print("\n" + "="*55)
+    print("  TERMINÉ !")
+    print("="*55)
+    print(f"\n  Anomalies : {payload['total_anomalies']}")
+    print(f"  Analyses  : {payload['total_analyses']}")
+    print(f"  Généré le : {payload['generated_at']}")
+    print(f"\n  URL Power Apps → Web viewer :")
     print(f'  "{url}"')
+    print()
